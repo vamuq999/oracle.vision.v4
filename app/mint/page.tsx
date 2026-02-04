@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useEffect, useMemo, useState } from "react";
+import { ethers } from "ethers";
 
 declare global {
   interface Window {
@@ -9,6 +10,17 @@ declare global {
 }
 
 const ETH_MAINNET_CHAIN_ID_HEX = "0x1";
+const CONTRACT_ADDRESS = "0x15545833cFCe7579D967D02A1183114d7e554889";
+
+// Minimal ABI: only what we use
+const ORACLE_ABI = [
+  // reads
+  "function name() view returns (string)",
+  "function symbol() view returns (string)",
+  "function MINT_PRICE() view returns (uint256)",
+  // write
+  "function mintOracleVision() payable",
+];
 
 function shortAddr(addr?: string) {
   if (!addr) return "—";
@@ -19,11 +31,25 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function etherscanTxUrl(txHash: string) {
+  return `https://etherscan.io/tx/${txHash}`;
+}
+
+function etherscanAddrUrl(addr: string) {
+  return `https://etherscan.io/address/${addr}`;
+}
+
 export default function MintPage() {
   const [hasProvider, setHasProvider] = useState(false);
   const [account, setAccount] = useState<string | null>(null);
   const [chainId, setChainId] = useState<string | null>(null);
+
+  const [collectionName, setCollectionName] = useState<string>("—");
+  const [symbol, setSymbol] = useState<string>("—");
+  const [mintPriceWei, setMintPriceWei] = useState<bigint | null>(null);
+
   const [busy, setBusy] = useState(false);
+  const [txHash, setTxHash] = useState<string | null>(null);
   const [log, setLog] = useState<{ t: string; msg: string }[]>([]);
 
   const isConnected = !!account;
@@ -35,6 +61,15 @@ export default function MintPage() {
     return `Chain ${chainId}`;
   }, [chainId]);
 
+  const priceEth = useMemo(() => {
+    if (mintPriceWei == null) return "—";
+    try {
+      return ethers.formatEther(mintPriceWei);
+    } catch {
+      return "—";
+    }
+  }, [mintPriceWei]);
+
   const status = useMemo(() => {
     if (!hasProvider) return { text: "MetaMask not found", tone: "bad" as const };
     if (!isConnected) return { text: "Not connected", tone: "warn" as const };
@@ -43,10 +78,25 @@ export default function MintPage() {
   }, [hasProvider, isConnected, isMainnet]);
 
   function push(msg: string) {
-    setLog((p) => [{ t: nowIso(), msg }, ...p].slice(0, 25));
+    setLog((p) => [{ t: nowIso(), msg }, ...p].slice(0, 30));
   }
 
-  async function refreshState() {
+  function humanizeEthersError(e: any) {
+    const msg = e?.shortMessage || e?.reason || e?.message || String(e);
+    // MetaMask user rejected
+    if (e?.code === 4001) return "User rejected the transaction.";
+    if (typeof msg === "string" && msg.toLowerCase().includes("user rejected"))
+      return "User rejected the transaction.";
+    return msg;
+  }
+
+  async function getProvider() {
+    if (!window.ethereum) return null;
+    // MetaMask injects an EIP-1193 provider; ethers wraps it
+    return new ethers.BrowserProvider(window.ethereum);
+  }
+
+  async function refreshWalletState() {
     if (!window.ethereum) return;
     try {
       const [acc] = (await window.ethereum.request({ method: "eth_accounts" })) as string[];
@@ -54,7 +104,37 @@ export default function MintPage() {
       setAccount(acc ?? null);
       setChainId(cid ?? null);
     } catch (e: any) {
-      push(`refreshState error: ${e?.message ?? String(e)}`);
+      push(`refreshWalletState error: ${humanizeEthersError(e)}`);
+    }
+  }
+
+  async function loadContractReads() {
+    // only load reads when provider exists; reads can be done even if not connected,
+    // but BrowserProvider may still require provider presence
+    const provider = await getProvider();
+    if (!provider) return;
+
+    try {
+      const readOnly = await provider.getSigner().catch(() => null);
+      // If user not connected, fall back to provider itself for reads.
+      // ethers Contract wants a runner; BrowserProvider works as runner for view calls too.
+      const runner: any = readOnly ?? provider;
+      const c = new ethers.Contract(CONTRACT_ADDRESS, ORACLE_ABI, runner);
+
+      const [n, s, p] = await Promise.all([
+        c.name() as Promise<string>,
+        c.symbol() as Promise<string>,
+        c.MINT_PRICE() as Promise<bigint>,
+      ]);
+
+      setCollectionName(n || "—");
+      setSymbol(s || "—");
+      setMintPriceWei(p ?? null);
+
+      push(`Loaded contract: ${n} (${s})`);
+      push(`Mint price: ${ethers.formatEther(p)} ETH`);
+    } catch (e: any) {
+      push(`Contract read failed: ${humanizeEthersError(e)}`);
     }
   }
 
@@ -68,6 +148,7 @@ export default function MintPage() {
       const accounts = (await window.ethereum.request({
         method: "eth_requestAccounts",
       })) as string[];
+
       const cid = (await window.ethereum.request({ method: "eth_chainId" })) as string;
 
       setAccount(accounts?.[0] ?? null);
@@ -75,8 +156,11 @@ export default function MintPage() {
 
       push(`Connected: ${accounts?.[0] ? shortAddr(accounts[0]) : "—"}`);
       push(`Chain: ${cid ?? "—"}`);
+
+      // after connect, load reads
+      await loadContractReads();
     } catch (e: any) {
-      push(`Connect failed: ${e?.message ?? String(e)}`);
+      push(`Connect failed: ${humanizeEthersError(e)}`);
     } finally {
       setBusy(false);
     }
@@ -91,38 +175,85 @@ export default function MintPage() {
         params: [{ chainId: ETH_MAINNET_CHAIN_ID_HEX }],
       });
       push("Switched to Ethereum Mainnet.");
-      await refreshState();
+      await refreshWalletState();
+      await loadContractReads();
     } catch (e: any) {
-      // If chain isn't available, MetaMask would require add — but ETH mainnet is always available.
-      push(`Switch failed: ${e?.message ?? String(e)}`);
+      push(`Switch failed: ${humanizeEthersError(e)}`);
     } finally {
       setBusy(false);
     }
   }
 
-  // Stub for next commit (real mint later)
-  async function mintStub() {
-    push("Mint is currently locked (next commit enables contract + tx).");
+  async function mint() {
+    if (!window.ethereum) return;
+    if (!isConnected) {
+      push("Connect your wallet first.");
+      return;
+    }
+    if (!isMainnet) {
+      push("Switch to Ethereum Mainnet first.");
+      return;
+    }
+
+    setBusy(true);
+    setTxHash(null);
+
+    try {
+      const provider = await getProvider();
+      if (!provider) throw new Error("No provider found.");
+
+      const signer = await provider.getSigner();
+      const c = new ethers.Contract(CONTRACT_ADDRESS, ORACLE_ABI, signer);
+
+      // Ensure we have a fresh price (avoid stale UI)
+      const price: bigint = await c.MINT_PRICE();
+      setMintPriceWei(price);
+
+      push(`Minting… value = ${ethers.formatEther(price)} ETH`);
+
+      const tx = await c.mintOracleVision({ value: price });
+      setTxHash(tx.hash);
+      push(`Tx sent: ${tx.hash}`);
+
+      // Wait for mining
+      const receipt = await tx.wait();
+      if (!receipt) {
+        push("Tx sent, but receipt not found yet.");
+      } else {
+        push(`Success ✅ Block: ${receipt.blockNumber}`);
+      }
+    } catch (e: any) {
+      push(`Mint failed: ${humanizeEthersError(e)}`);
+    } finally {
+      setBusy(false);
+    }
   }
 
   useEffect(() => {
     setHasProvider(!!window.ethereum);
-    refreshState();
+    refreshWalletState();
 
     if (!window.ethereum) return;
 
     const onAccounts = (accs: string[]) => {
       setAccount(accs?.[0] ?? null);
       push(`Account changed: ${accs?.[0] ? shortAddr(accs[0]) : "Disconnected"}`);
+      // refresh reads on account change
+      loadContractReads();
     };
 
     const onChain = (cid: string) => {
       setChainId(cid ?? null);
       push(`Network changed: ${cid ?? "—"}`);
+      // refresh reads on network change
+      loadContractReads();
     };
 
     window.ethereum.on?.("accountsChanged", onAccounts);
     window.ethereum.on?.("chainChanged", onChain);
+
+    // initial contract reads
+    loadContractReads();
 
     return () => {
       window.ethereum.removeListener?.("accountsChanged", onAccounts);
@@ -136,7 +267,7 @@ export default function MintPage() {
       <div className="mb-6">
         <h1 className="text-3xl font-semibold tracking-tight">Oracle Vision — Mint Console</h1>
         <p className="mt-2 text-sm opacity-80">
-          ETH Mainnet only. Classy chain. No excuses.
+          Ethereum Mainnet only. Clean mints. Clear receipts.
         </p>
       </div>
 
@@ -167,8 +298,15 @@ export default function MintPage() {
               <span>{chainLabel}</span>
             </div>
             <div className="flex items-center justify-between">
-              <span className="opacity-70">Chain ID</span>
-              <span className="font-mono">{chainId ?? "—"}</span>
+              <span className="opacity-70">Contract</span>
+              <a
+                className="font-mono underline underline-offset-4 opacity-90"
+                href={etherscanAddrUrl(CONTRACT_ADDRESS)}
+                target="_blank"
+                rel="noreferrer"
+              >
+                {shortAddr(CONTRACT_ADDRESS)}
+              </a>
             </div>
           </div>
 
@@ -191,8 +329,9 @@ export default function MintPage() {
               </button>
             ) : (
               <button
-                onClick={() => push("Connection looks good. Next commit: contract + real mint tx.")}
-                className="rounded-xl border border-white/15 bg-white/5 px-4 py-2 text-sm font-semibold"
+                onClick={() => push("Wallet + network ready.")}
+                disabled={busy}
+                className="rounded-xl border border-white/15 bg-white/5 px-4 py-2 text-sm font-semibold disabled:opacity-50"
               >
                 Connected ✓
               </button>
@@ -217,41 +356,74 @@ export default function MintPage() {
 
           <div className="mt-4 grid gap-3 sm:grid-cols-3">
             <div className="rounded-xl border border-white/10 bg-black/20 p-3">
-              <div className="text-xs opacity-70">Contract</div>
-              <div className="mt-1 font-mono text-sm">0x… (next commit)</div>
+              <div className="text-xs opacity-70">Collection</div>
+              <div className="mt-1 text-sm font-semibold">{collectionName}</div>
+              <div className="mt-1 text-xs opacity-70">{symbol}</div>
             </div>
+
             <div className="rounded-xl border border-white/10 bg-black/20 p-3">
-              <div className="text-xs opacity-70">Price</div>
-              <div className="mt-1 text-sm">— ETH (next commit)</div>
+              <div className="text-xs opacity-70">Mint Price</div>
+              <div className="mt-1 text-sm">
+                {priceEth === "—" ? "—" : `${priceEth} ETH`}
+              </div>
+              <div className="mt-1 text-xs opacity-70">from MINT_PRICE()</div>
             </div>
+
             <div className="rounded-xl border border-white/10 bg-black/20 p-3">
-              <div className="text-xs opacity-70">Supply</div>
-              <div className="mt-1 text-sm">— / — (next commit)</div>
+              <div className="text-xs opacity-70">Method</div>
+              <div className="mt-1 font-mono text-sm">mintOracleVision()</div>
+              <div className="mt-1 text-xs opacity-70">payable</div>
             </div>
           </div>
 
-          <div className="mt-4 flex flex-col gap-2 sm:flex-row">
+          <div className="mt-4 flex flex-col gap-2 sm:flex-row sm:items-center">
             <button
-              onClick={mintStub}
-              disabled={!isConnected || !isMainnet || busy}
+              onClick={mint}
+              disabled={!isConnected || !isMainnet || busy || mintPriceWei == null}
               className="rounded-xl bg-white text-black px-4 py-2 text-sm font-semibold disabled:opacity-50"
             >
-              {busy ? "…" : "Mint (locked until contract added)"}
+              {busy ? "Minting…" : "Mint on ETH Mainnet"}
+            </button>
+
+            <button
+              onClick={() => loadContractReads()}
+              disabled={busy}
+              className="rounded-xl border border-white/15 bg-white/5 px-4 py-2 text-sm font-semibold disabled:opacity-50"
+            >
+              Refresh
             </button>
 
             <button
               onClick={() => setLog([])}
-              className="rounded-xl border border-white/15 bg-white/5 px-4 py-2 text-sm font-semibold"
+              disabled={busy}
+              className="rounded-xl border border-white/15 bg-white/5 px-4 py-2 text-sm font-semibold disabled:opacity-50"
             >
               Clear Log
             </button>
           </div>
 
+          {txHash && (
+            <div className="mt-4 rounded-xl border border-white/10 bg-black/30 p-3">
+              <div className="text-xs opacity-70">Latest Transaction</div>
+              <div className="mt-1 flex flex-wrap items-center gap-2">
+                <span className="font-mono text-sm">{shortAddr(txHash)}</span>
+                <a
+                  className="text-sm underline underline-offset-4"
+                  href={etherscanTxUrl(txHash)}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  View on Etherscan
+                </a>
+              </div>
+            </div>
+          )}
+
           {/* Telemetry / Log */}
           <div className="mt-5">
             <div className="flex items-center justify-between">
               <h3 className="text-sm font-semibold">Telemetry</h3>
-              <span className="text-xs opacity-70">last 25 events</span>
+              <span className="text-xs opacity-70">last 30 events</span>
             </div>
 
             <div className="mt-2 max-h-64 overflow-auto rounded-xl border border-white/10 bg-black/30 p-3">
@@ -271,7 +443,7 @@ export default function MintPage() {
             </div>
 
             <p className="mt-2 text-xs opacity-70">
-              Next: inject contract address + ABI + real mint transaction + explorer link.
+              Tip: If mint fails, the error message above will tell you why (wrong network, insufficient ETH, paused mint, etc).
             </p>
           </div>
         </section>
